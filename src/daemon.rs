@@ -96,6 +96,48 @@ fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Resu
     bail!("non-object reply: {:?}", reply);
 }
 
+/// `submitpackage`'s reply, as Bitcoin Core returns it. Ported from
+/// Blockstream/electrs.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubmitPackageResult {
+    package_msg: String,
+    #[serde(rename = "tx-results")]
+    tx_results: HashMap<String, TxResult>,
+    #[serde(rename = "replaced-transactions")]
+    replaced_transactions: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TxResult {
+    txid: String,
+    #[serde(rename = "other-wtxid")]
+    other_wtxid: Option<String>,
+    vsize: Option<u32>,
+    fees: Option<MempoolFeesSubmitPackage>,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MempoolFeesSubmitPackage {
+    base: f64,
+    #[serde(rename = "effective-feerate")]
+    effective_feerate: Option<f64>,
+    #[serde(rename = "effective-includes")]
+    effective_includes: Option<Vec<String>>,
+}
+
+impl SubmitPackageResult {
+    /// Txids of the transactions this submission put in the daemon's
+    /// mempool (those without a per-transaction error).
+    pub fn accepted_txids(&self) -> Vec<Txid> {
+        self.tx_results
+            .values()
+            .filter(|tx| tx.error.is_none())
+            .filter_map(|tx| Txid::from_hex(&tx.txid).ok())
+            .collect()
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BlockchainInfo {
     pub chain: String,
@@ -534,6 +576,27 @@ impl Daemon {
             Txid::from_hex(txid.as_str().chain_err(|| "non-string txid")?)
                 .chain_err(|| "failed to parse txid")?,
         )
+    }
+
+    /// `submitpackage` (Bitcoin Core 28+): a child with its unconfirmed
+    /// parents, evaluated together, so the child's fee can carry a parent
+    /// below the mempool minimum. Ported from Blockstream/electrs.
+    pub fn submit_package(
+        &self,
+        txhex: Vec<String>,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> Result<SubmitPackageResult> {
+        let params = match (maxfeerate, maxburnamount) {
+            (Some(rate), Some(burn)) => {
+                json!([txhex, format!("{:.8}", rate), format!("{:.8}", burn)])
+            }
+            (Some(rate), None) => json!([txhex, format!("{:.8}", rate)]),
+            (None, Some(burn)) => json!([txhex, null, format!("{:.8}", burn)]),
+            (None, None) => json!([txhex]),
+        };
+        let result = self.request("submitpackage", params)?;
+        from_value::<SubmitPackageResult>(result).chain_err(|| "invalid submitpackage reply")
     }
 
     // Get estimated feerates for the provided confirmation targets using a batch RPC request
